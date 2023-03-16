@@ -6,7 +6,7 @@ require (
 	cloud.google.com/go/bigquery v1.48.0
 	cloud.google.com/go/compute/metadata v0.2.3
 	cloud.google.com/go/firestore v1.9.0
-	cloud.google.com/go/functions v1.10.0
+	cloud.google.com/go/functions v1.11.0
 	cloud.google.com/go/kms v1.9.0
 	cloud.google.com/go/logging v1.7.0
 	cloud.google.com/go/pubsub v1.29.0
@@ -63,7 +63,7 @@ require (
 	sigs.k8s.io/yaml v1.3.0
 )
 
-require k8s.io/test-infra v0.0.0-20230314173416-d13af5dafcc3
+require k8s.io/test-infra v0.0.0-20230315233305-7c4145d33ac2
 
 require (
 	cloud.google.com/go v0.110.0 // indirect
