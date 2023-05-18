@@ -39,7 +39,7 @@ require (
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/procfs v0.7.3 // indirect
 	github.com/shurcooL/githubv4 v0.0.0-20211117020012-5800b9de5b8b
-	github.com/sirupsen/logrus v1.9.0
+	github.com/sirupsen/logrus v1.9.2
 	github.com/smartystreets/goconvey v1.8.0
 	github.com/spf13/cobra v1.7.0
 	github.com/spf13/pflag v1.0.5
@@ -62,7 +62,7 @@ require (
 	sigs.k8s.io/yaml v1.3.0
 )
 
-require k8s.io/test-infra v0.0.0-20230509183758-470d08f401d8
+require k8s.io/test-infra v0.0.0-20230518093433-93b208617925
 
 require (
 	cloud.google.com/go v0.110.0 // indirect
