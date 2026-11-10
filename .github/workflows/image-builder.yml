@@ -1,0 +1,163 @@
+# See documentation at https://github.com/kyma-project/test-infra/blob/main/cmd/image-builder/github-workflow-integration.md
+
+name: image-builder
+
+on:
+  workflow_call:
+    inputs:
+      name:
+        description: Name of the build image
+        required: false
+        type: string
+        default: ${{ github.event.repository.name }}
+      dockerfile:
+        description: Path to the dockerfile used to build docker image
+        required: false
+        type: string
+        default: "./Dockerfile"
+      context:
+        description: Build context to build container from
+        required: false
+        type: string
+        default: .
+      build-args:
+        description: "Additional arguments to build dockerfile, one per line. It can be used in the name=value format."
+        required: false
+        type: string
+        default: ""
+      tags:
+        description: "Additional tags, one per line, that the image will be tagged with. Optionally you can pass the name in the format name=value which will be used by export-tags"
+        required: false
+        type: string
+        default: ""
+      export-tags:
+        description: Export parsed tags as build-args into dockerfile. Each tag will have format TAG_x, where x is the tag name passed along with the tag
+        required: false
+        type: boolean
+        default: false
+      use-go-internal-sap-modules:
+        description: Setup access to Go internal SAP modules in build environment
+        required: false
+        type: boolean
+        default: false
+      platforms:
+        description: The platforms to build the image for, one per line. If not set, the default platforms (linux/arm64,linux/amd64) will be used.
+        required: false
+        type: string
+        default: |
+          linux/arm64
+          linux/amd64
+      target:
+        description: Specify which build stage in the Dockerfile to use as the target
+        required: false
+        type: string
+        default: ""
+      use-restricted-registry:
+        description: Enable building images using Chainguard restricted base images
+        required: false
+        type: boolean
+        default: false
+
+    outputs:
+      images:
+        description: JSON list of images built by image-builder
+        value: ${{ jobs.build-image.outputs.images }}
+      adoResult:
+        description: The result of the ADO pipeline execution
+        value: ${{ jobs.build-image.outputs.result }}
+      digest:
+        description: The digest of the built image (e.g. sha256:abc123...)
+        value: ${{ jobs.build-image.outputs.digest }}
+      build-report:
+        description: Full build report as JSON containing status, images, digest, tags, architectures, etc.
+        value: ${{ jobs.build-image.outputs.build-report }}
+
+jobs:
+  build-image:
+    permissions:
+      id-token: write # This is required for requesting the JWT token
+      contents: read # This is required for actions/checkout
+    runs-on: ubuntu-latest
+    name: Build image
+    outputs:
+      images: ${{ steps.build.outputs.images }}
+      result: ${{ steps.build.outputs.adoResult }}
+      digest: ${{ steps.build.outputs.digest }}
+      build-report: ${{ steps.build.outputs.build-report }}
+    steps:
+      - name: Verify caller workflow_ref
+        run: |
+          echo "Caller workflow_ref: ${{ github.workflow_ref }}"
+        continue-on-error: true
+
+      - name: Verify repository owner
+        id: verify_repo_owner
+        if: ${{ github.repository_owner != 'kyma-project' }}
+        run: |
+          echo "Using image-builder workflow outside of kyma-project organisation is not supported."
+          exit 1
+
+      - name: Checkout test-infra repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          repository: kyma-project/test-infra
+          ref: main
+
+      - name: Install Node.js and needed dependencies
+        uses: ./.github/actions/expose-jwt-action/install
+
+      - name: Get OIDC token
+        id: get_oidc
+        uses: ./.github/actions/expose-jwt-action
+        with:
+          audience: "image-builder"
+
+      - name: Authenticate in GCP
+        id: "auth"
+        uses: "google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093" # v3
+        with:
+          project_id: ${{ vars.GCP_KYMA_PROJECT_PROJECT_ID }}
+          workload_identity_provider: ${{ vars.GH_COM_KYMA_PROJECT_GCP_WORKLOAD_IDENTITY_FEDERATION_PROVIDER }}
+
+      - name: Get secrets from Secret Manager
+        id: "secrets"
+        uses: "google-github-actions/get-secretmanager-secrets@bc9c54b29fdffb8a47776820a7d26e77b379d262" # v3
+        with:
+          secrets: |-
+            tenant-id:${{ vars.GCP_KYMA_PROJECT_PROJECT_ID }}/${{ vars.IMAGE_BUILDER_AZURE_SP_TENANT_ID_GCP_SECRET_NAME }}
+            client-id:${{ vars.GCP_KYMA_PROJECT_PROJECT_ID }}/${{ vars.IMAGE_BUILDER_AZURE_SP_CLIENT_ID_GCP_SECRET_NAME }}
+            client-secret:${{ vars.GCP_KYMA_PROJECT_PROJECT_ID }}/${{ vars.IMAGE_BUILDER_AZURE_SP_CLIENT_SECRET_GCP_SECRET_NAME }}
+
+      - name: Build image
+        id: build
+        uses: ./.github/actions/image-builder
+        with:
+          oidc-token: ${{ steps.get_oidc.outputs.jwt }}
+          azure-client-id: ${{ steps.secrets.outputs.client-id }}
+          azure-client-secret: ${{ steps.secrets.outputs.client-secret }}
+          azure-tenant-id: ${{ steps.secrets.outputs.tenant-id }}
+          context: ${{ inputs.context }}
+          build-args: ${{ inputs.build-args }}
+          tags: ${{ inputs.tags }}
+          export-tags: ${{ inputs.export-tags }}
+          image-name: ${{ inputs.name }}
+          dockerfile: ${{ inputs.dockerfile }}
+          config: "./configs/image-builder-client-config.yaml"
+          use-go-internal-sap-modules: ${{ inputs.use-go-internal-sap-modules }}
+          platforms: ${{ inputs.platforms }}
+          target: ${{ inputs.target }}
+          use-restricted-registry: ${{ inputs.use-restricted-registry }}
+
+      - name: Print built images
+        run: |
+          images=$(echo '${{ steps.build.outputs.images }}' | jq -r '.[]')
+          architectures=$(echo '${{ steps.build.outputs.architectures }}' | jq -r '. | join(",")')
+
+          if [[ -n "$images" ]]; then
+              echo "### 🏗️ Images built! 🏗️" >> $GITHUB_STEP_SUMMARY
+              echo "| Image | Architecture |" >> $GITHUB_STEP_SUMMARY
+              echo "|-------|--------------|" >> $GITHUB_STEP_SUMMARY
+              for image in $images; do
+                  echo "| $image | $architectures |" >> $GITHUB_STEP_SUMMARY
+              done
+          fi

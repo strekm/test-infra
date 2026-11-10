@@ -1,22 +1,28 @@
 package main
 
 import (
-	"bufio"
+	"context"
+	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
-	"io/fs"
+	"log"
+	"net/http"
 	"os"
-	"os/exec"
-	"path"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"sync"
 
+	adoauth "github.com/kyma-project/test-infra/pkg/azuredevops/auth"
+	adopipelines "github.com/kyma-project/test-infra/pkg/azuredevops/pipelines"
+	"github.com/kyma-project/test-infra/pkg/github/actions"
+	"github.com/kyma-project/test-infra/pkg/imagebuilder"
+	"github.com/kyma-project/test-infra/pkg/logging"
 	"github.com/kyma-project/test-infra/pkg/sets"
 	"github.com/kyma-project/test-infra/pkg/sign"
 	"github.com/kyma-project/test-infra/pkg/tags"
+	"github.com/microsoft/azure-devops-go-api/azuredevops/v7/pipelines"
+	"go.uber.org/zap"
 	errutil "k8s.io/apimachinery/pkg/util/errors"
 )
 
@@ -25,221 +31,350 @@ type options struct {
 	configPath string
 	context    string
 	dockerfile string
-	envFile    string
 	name       string
-	variant    string
 	logDir     string
+	logger     Logger
 	orgRepo    string
 	silent     bool
 	isCI       bool
 	tags       sets.Tags
+	tagsBase64 string
 	buildArgs  sets.Tags
 	platforms  sets.Strings
 	exportTags bool
+	// signOnly only sign images. No build will be performed.
+	signOnly                bool
+	imagesToSign            sets.Strings
+	adoPreviewRun           bool
+	adoPreviewRunYamlPath   string
+	parseTagsOnly           bool
+	oidcToken               string
+	azureClientID           string
+	azureClientSecret       string
+	azureTenantID           string
+	ciSystem                CISystem
+	gitState                GitStateConfig
+	debug                   bool
+	dryRun                  bool
+	tagsOutputFile          string
+	useGoInternalSAPModules bool
+	// buildReportPath is a path to the file where the build report will be saved
+	// build report will be used by SRE team to gather information about the build
+	buildReportPath string
+	// adoStateOutput indicates if the success or failure of the command (sign or build) should be
+	// reported as an output variable in Azure DevOps
+	adoStateOutput        bool
+	target                string
+	useRestrictedRegistry bool
 }
 
-const (
-	PlatformLinuxAmd64 = "linux/amd64"
-	PlatformLinuxArm64 = "linux/arm64"
-)
-
-// parseVariable returns a build-arg.
-// Keys are set to upper-case.
-func parseVariable(key, value string) string {
-	k := strings.TrimSpace(key)
-	return k + "=" + strings.TrimSpace(value)
+type Logger interface {
+	logging.StructuredLoggerInterface
+	logging.WithLoggerInterface
 }
 
-// runInBuildKit prepares command execution and handles gathering logs from BuildKit-enabled run
-// This function is used only in customized environment
-func runInBuildKit(o options, name string, destinations, platforms []string, buildArgs map[string]string) error {
-	dockerfile := filepath.Base(o.dockerfile)
-	dockerfileDir := filepath.Dir(o.dockerfile)
-	args := []string{
-		"build", "--frontend=dockerfile.v0",
-		"--local", "context=" + o.context,
-		"--local", "dockerfile=" + filepath.Join(o.context, dockerfileDir),
-		"--opt", "filename=" + dockerfile,
+// prepareADOTemplateParameters is a function that prepares the parameters for the Azure DevOps oci-image-builder pipeline.
+// These parameters are used to trigger the pipeline with API call and build the image in the ADO environment.
+// It takes an options struct as an argument and returns an OCIImageBuilderTemplateParams struct and an error.
+// The function fetches various environment variables such as REPO_NAME, REPO_OWNER, JOB_TYPE, PULL_NUMBER, PULL_BASE_SHA, and PULL_PULL_SHA.
+// It validates these variables are present and sets them in the templateParameters struct.
+// It also sets other parameters from the options struct such as imageName, dockerfilePath, buildContext, exportTags, useKanikoConfigFromPR, buildArgs, and imageTags.
+// The function validates the templateParameters and returns it along with any error that occurred during the process.
+// TODO: rename this function to indicate that it's preparing ADO pipeline parameters for oci-image-builder pipeline.
+func prepareADOTemplateParameters(options options) (adopipelines.OCIImageBuilderTemplateParams, error) {
+	templateParameters := make(adopipelines.OCIImageBuilderTemplateParams)
+
+	templateParameters.SetRepoName(options.gitState.RepositoryName)
+
+	templateParameters.SetRepoOwner(options.gitState.RepositoryOwner)
+
+	switch options.gitState.JobType {
+	case "presubmit":
+		templateParameters.SetPresubmitJobType()
+	case "postsubmit":
+		templateParameters.SetPostsubmitJobType()
+	case "workflow_dispatch":
+		templateParameters.SetWorkflowDispatchJobType()
+	case "schedule":
+		templateParameters.SetScheduleJobType()
+	case "merge_group":
+		templateParameters.SetMergeGroupJobType()
+	default:
+		return nil, fmt.Errorf("unknown JobType received, ensure image-builder runs on supported event")
 	}
 
-	// output definition, multiple images support
-	args = append(args, "--output", "type=image,\"name="+strings.Join(destinations, ",")+"\",push=true")
-
-	// build-args
-	for k, v := range buildArgs {
-		args = append(args, "--opt", "build-arg:"+parseVariable(k, v))
+	if options.gitState.IsPullRequest() {
+		templateParameters.SetPullNumber(fmt.Sprint(options.gitState.PullRequestNumber))
 	}
 
-	if len(platforms) > 0 {
-		args = append(args, "--opt", "platform="+strings.Join(platforms, ","))
+	templateParameters.SetBaseSHA(options.gitState.BaseCommitSHA)
+
+	if len(options.gitState.BaseCommitRef) > 0 {
+		templateParameters.SetBaseRef(options.gitState.BaseCommitRef)
 	}
 
-	if o.Cache.Enabled {
-		// TODO (@Ressetkk): Implement multiple caches, see https://github.com/moby/buildkit#export-cache
-		args = append(args,
-			"--export-cache", "type=registry,ref="+o.Cache.CacheRepo,
-			"--import-cache", "type=registry,ref="+o.Cache.CacheRepo)
+	if options.gitState.IsPullRequest() {
+		templateParameters.SetPullSHA(options.gitState.PullHeadCommitSHA)
 	}
 
-	cmd := exec.Command("buildctl-daemonless.sh", args...)
+	templateParameters.SetImageName(options.name)
 
-	var outw []io.Writer
-	var errw []io.Writer
+	templateParameters.SetDockerfilePath(options.dockerfile)
 
-	if !o.silent {
-		outw = append(outw, os.Stdout)
-		errw = append(errw, os.Stderr)
+	templateParameters.SetBuildContext(options.context)
+
+	templateParameters.SetExportTags(options.exportTags)
+
+	if len(options.buildArgs) > 0 {
+		templateParameters.SetBuildArgs(options.buildArgs.String())
 	}
 
-	f, err := os.Create(filepath.Join(o.logDir, strings.TrimSpace("build_"+strings.TrimSpace(name)+".log")))
-	if err != nil {
-		return fmt.Errorf("could not create log file: %w", err)
+	if len(options.tags) > 0 {
+		templateParameters.SetImageTags(options.tags.String())
 	}
 
-	outw = append(outw, f)
-	errw = append(errw, f)
-
-	cmd.Stdout = io.MultiWriter(outw...)
-	cmd.Stderr = io.MultiWriter(errw...)
-
-	return cmd.Run()
-}
-
-// runInKaniko prepares command execution and handles gathering logs to file
-func runInKaniko(o options, name string, destinations, platforms []string, buildArgs map[string]string) error {
-	args := []string{
-		"--context=" + o.context,
-		"--dockerfile=" + o.dockerfile,
-	}
-	for _, dst := range destinations {
-		args = append(args, "--destination="+dst)
+	if options.oidcToken != "" {
+		templateParameters.SetAuthorization(options.oidcToken)
 	}
 
-	for k, v := range buildArgs {
-		args = append(args, "--build-arg="+parseVariable(k, v))
+	if options.useGoInternalSAPModules {
+		templateParameters.SetUseGoInternalSAPModules()
 	}
 
-	if len(platforms) > 0 {
-		fmt.Println("'--platform' parameter not supported in kaniko-mode. Use buildkit-enabled image")
-	}
-
-	if o.Config.Cache.Enabled {
-		args = append(args, "--cache="+strconv.FormatBool(o.Cache.Enabled),
-			"--cache-copy-layers="+strconv.FormatBool(o.Cache.CacheCopyLayers),
-			"--cache-run-layers="+strconv.FormatBool(o.Cache.CacheRunLayers),
-			"--cache-repo="+o.Cache.CacheRepo)
-	}
-
-	if o.Config.LogFormat != "" {
-		args = append(args, "--log-format="+o.Config.LogFormat)
-	}
-
-	if o.Config.Reproducible {
-		args = append(args, "--reproducible=true")
-	}
-
-	cmd := exec.Command("/kaniko/executor", args...)
-
-	var outw []io.Writer
-	var errw []io.Writer
-
-	if !o.silent {
-		outw = append(outw, os.Stdout)
-		errw = append(errw, os.Stderr)
-	}
-
-	f, err := os.Create(filepath.Join(o.logDir, strings.TrimSpace("build_"+strings.TrimSpace(name)+".log")))
-	if err != nil {
-		return fmt.Errorf("could not create log file: %w", err)
-	}
-
-	outw = append(outw, f)
-	errw = append(errw, f)
-
-	cmd.Stdout = io.MultiWriter(outw...)
-	cmd.Stderr = io.MultiWriter(errw...)
-
-	return cmd.Run()
-}
-
-func runBuildJob(o options, vs Variants, envs map[string]string) error {
-	runFunc := runInKaniko
-	if os.Getenv("USE_BUILDKIT") == "true" {
-		runFunc = runInBuildKit
-	}
-	var sha, pr string
-	var err error
-	repo := o.Config.Registry
-	if o.isCI {
-		presubmit := os.Getenv("JOB_TYPE") == "presubmit"
-		if presubmit {
-			if len(o.DevRegistry) > 0 {
-				repo = o.DevRegistry
-			}
-			if n := os.Getenv("PULL_NUMBER"); n != "" {
-				pr = n
-			}
-		}
-
-		if c := os.Getenv("PULL_BASE_SHA"); c != "" {
-			sha = c
-		}
-	}
-
-	// if sha is still not set, fail the pipeline
-	if sha == "" {
-		return fmt.Errorf("'sha' could not be determined")
-	}
-
-	parsedTags, err := getTags(pr, sha, append(o.tags, o.TagTemplate))
-	if err != nil {
-		return err
-	}
-
-	// Provide parsedTags as buildArgs for developers
-	var buildArgs map[string]string
-	if o.exportTags {
-		buildArgs = addTagsToEnv(parsedTags, envs)
+	if len(options.platforms) > 0 {
+		templateParameters.SetPlatforms(options.platforms.String())
 	} else {
-		buildArgs = envs
+		// Set default platforms to linux/amd64,linux/arm64, if not set. There is no way to set during flag parsing.
+		templateParameters.SetPlatforms("linux/amd64,linux/arm64")
 	}
 
-	if buildArgs == nil {
-		buildArgs = make(map[string]string)
+	if options.target != "" {
+		templateParameters.SetTarget(options.target)
 	}
 
-	appendMissing(&buildArgs, o.buildArgs)
-
-	if len(vs) == 0 {
-		// variants.yaml file not present or either empty. Run single build.
-		destinations := gatherDestinations(repo, o.name, parsedTags)
-		fmt.Println("Starting build for image: ", strings.Join(destinations, ", "))
-		err = runFunc(o, "build", destinations, o.platforms, buildArgs)
-		if err != nil {
-			return fmt.Errorf("build encountered error: %w", err)
-		}
-
-		err := signImages(&o, destinations)
-		if err != nil {
-			return fmt.Errorf("sign encountered error: %w", err)
-		}
-		fmt.Println("Successfully built image:", strings.Join(destinations, ", "))
-		return nil
+	if options.useRestrictedRegistry {
+		templateParameters.SetUseRestrictedRegistry()
 	}
-	return fmt.Errorf("building variants is not supported at this moment")
+
+	err := templateParameters.Validate()
+	if err != nil {
+		return nil, fmt.Errorf("failed validating ADO template parameters, err: %w", err)
+	}
+
+	return templateParameters, nil
 }
 
-// appendMissing appends key, values pairs from source array to target map
-func appendMissing(target *map[string]string, source []tags.Tag) {
-	if len(source) > 0 {
-		for _, arg := range source {
-			if _, exists := (*target)[arg.Name]; !exists {
-				(*target)[arg.Name] = arg.Value
+// buildInADO is a function that triggers the Azure DevOps (ADO) pipeline to build an image.
+// It takes an options struct as an argument and returns an error.
+// The function fetches Azure AD Service Principal credentials from environment variables and validates they are present.
+// The function prepares the ADO pipeline parameters by calling the prepareADOTemplateParameters function.
+// It creates a new ADO client authenticated via Service Principal and prepares the ADO pipeline run arguments.
+// The function triggers the ADO build pipeline and waits for the pipeline run to finish.
+// It fetches the ADO pipeline run logs and prints them.
+// The function can trigger the ADO pipeline in preview mode if the adoPreviewRun flag is set to true.
+// In preview mode, the function prints the final yaml of the ADO pipeline run.
+// Running in preview mode requires the adoPreviewRunYamlPath flag to be set to the path of the yaml file with the ADO pipeline definition.
+// This is used for pipeline syntax validation.
+// If the pipeline run fails, the function returns an error.
+// If the pipeline run is successful, the function returns nil.
+// TODO(dekiel): refactor this function to accept clients as parameters to make it testable with mocks.
+func buildInADO(o options) error {
+	fmt.Println("Building image in ADO pipeline.")
+
+	// Getting Azure AD Service Principal credentials from environment variables when not set via flags.
+	if o.azureClientID == "" {
+		o.azureClientID = os.Getenv("AZURE_CLIENT_ID")
+	}
+	if o.azureClientSecret == "" {
+		o.azureClientSecret = os.Getenv("AZURE_CLIENT_SECRET")
+	}
+	if o.azureTenantID == "" {
+		o.azureTenantID = os.Getenv("AZURE_TENANT_ID")
+	}
+
+	if !o.dryRun {
+		if o.azureClientID == "" || o.azureClientSecret == "" || o.azureTenantID == "" {
+			return fmt.Errorf("build in ADO failed, no authentication method configured: provide --azure-client-id, --azure-client-secret and --azure-tenant-id")
+		}
+	} else {
+		fmt.Println("Running in dry-run mode. Skipping authentication check.")
+	}
+
+	if o.gitState.isPullRequest && o.gitState.PullRequestNumber > 0 && len(o.AdditionalPRTag.Value) > 0 {
+		pr := fmt.Sprint(o.gitState.PullRequestNumber)
+		resolvedAdditionalTags, err := getTags(o.logger, pr, "", []tags.Tag{o.AdditionalPRTag})
+		if err != nil {
+			return fmt.Errorf("build in ADO failed, failed resolving additional PR tag: %w", err)
+		}
+		o.tags = append(o.tags, resolvedAdditionalTags...)
+	}
+
+	fmt.Println("Preparing ADO template parameters.")
+	// Preparing ADO pipeline parameters.
+	templateParameters, err := prepareADOTemplateParameters(o)
+	if err != nil {
+		return fmt.Errorf("build in ADO failed, failed preparing ADO template parameters, err: %s", err)
+	}
+	fmt.Printf("Using TemplateParameters: %+v\n", templateParameters)
+
+	ctx := context.Background()
+
+	var opts []adopipelines.RunPipelineArgsOptions
+	// If running in preview mode, add a preview run option to the ADO pipeline run arguments.
+	if o.adoPreviewRun {
+		fmt.Println("Running in preview mode.")
+		// Adding a path to the yaml file with the ADO pipeline definition for parsing it in a preview run.
+		opts = append(opts, adopipelines.PipelinePreviewRun(o.adoPreviewRunYamlPath))
+	}
+
+	fmt.Println("Preparing ADO pipeline run arguments.")
+	// Composing ADO pipeline run arguments.
+	runPipelineArgs, err := adopipelines.NewRunPipelineArgs(templateParameters, o.AdoConfig.GetADOConfig(), opts...)
+	if err != nil {
+		return fmt.Errorf("build in ADO failed, failed creating ADO pipeline run args, err: %s", err)
+	}
+
+	fmt.Println("Triggering ADO build pipeline")
+	var (
+		pipelineRunResult *pipelines.RunResult
+		logs              string
+		buildReport       *imagebuilder.BuildReport
+	)
+	if !o.dryRun {
+		// Creating a new ADO pipelines client.
+		spCfg := adoauth.ServicePrincipalConfig{
+			TenantID:     o.azureTenantID,
+			ClientID:     o.azureClientID,
+			ClientSecret: o.azureClientSecret,
+		}
+		cred, err := adoauth.NewServicePrincipalCredential(spCfg)
+		if err != nil {
+			return fmt.Errorf("build in ADO failed, failed creating service principal credential: %w", err)
+		}
+		provider := adoauth.NewServicePrincipalProvider(cred)
+		adoClient, err := adopipelines.NewClientWithSP(ctx, o.AdoConfig.ADOOrganizationURL, provider)
+		if err != nil {
+			return fmt.Errorf("build in ADO failed, failed creating ADO client with service principal: %w", err)
+		}
+		fmt.Println("Using Service Principal authentication.")
+
+		// Triggering ADO build pipeline.
+		pipelineRun, err := adoClient.RunPipeline(ctx, runPipelineArgs)
+		if err != nil {
+			return fmt.Errorf("build in ADO failed, failed running ADO pipeline, err: %s", err)
+		}
+
+		// If running in preview mode, print the final yaml of ADO pipeline run for provided ADO pipeline definition and return.
+		if o.adoPreviewRun {
+			if pipelineRun.FinalYaml != nil {
+				fmt.Printf("ADO pipeline preview run final yaml\n: %s", *pipelineRun.FinalYaml)
+			} else {
+				fmt.Println("ADO pipeline preview run final yaml is empty")
+			}
+			return nil
+		}
+
+		// Fetch the ADO pipeline run result.
+		// GetRunResult function waits for the pipeline runs to finish and returns the result.
+		// TODO(dekiel) make the timeout configurable instead of hardcoding it.
+		pipelineRunResult, err = adopipelines.GetRunResult(ctx, adoClient, o.AdoConfig.GetADOConfig(), pipelineRun.Id)
+		if err != nil {
+			return fmt.Errorf("build in ADO failed, failed getting ADO pipeline run result, err: %s", err)
+		}
+		fmt.Printf("ADO pipeline run finished with status: %s\n", *pipelineRunResult)
+
+		// Fetch the ADO pipeline run logs.
+		fmt.Println("Getting ADO pipeline run logs.")
+		adoBuildClient, err := adopipelines.NewBuildClientWithSP(ctx, o.AdoConfig.ADOOrganizationURL, provider)
+		if err != nil {
+			fmt.Printf("Can't read ADO pipeline run logs, failed creating ADO build client, err: %s", err)
+		} else {
+			logs, err = adopipelines.GetRunLogsWithBearerToken(ctx, adoBuildClient, &http.Client{}, o.AdoConfig.GetADOConfig(), pipelineRun.Id, provider)
+			if err != nil {
+				fmt.Printf("Failed read ADO pipeline run logs, err: %s", err)
+			} else {
+				fmt.Printf("ADO pipeline image build logs:\n%s", logs)
 			}
 		}
+
+		fmt.Println("Getting build report.")
+		// Parse the build report from the ADO pipeline run logs.
+		buildReport, err = imagebuilder.NewBuildReportFromLogs(logs)
+		if err != nil {
+			return fmt.Errorf("build in ADO failed, failed parsing build report from ADO pipeline run logs, err: %s", err)
+		}
+
+		o.logger.Debugw("Parsed build report from ADO logs", "buildReport", buildReport)
+	} else {
+		dryRunPipelineRunResult := pipelines.RunResult("Succeeded")
+		pipelineRunResult = &dryRunPipelineRunResult
+		buildReport = &imagebuilder.BuildReport{}
 	}
+
+	// TODO: Setting github outputs should happen outside buildInADO function.
+	//  buildInADO should return required data and caller should handle it.
+	// if run in github actions, set output parameters
+	if o.ciSystem == GithubActions {
+		fmt.Println("Setting GitHub outputs.")
+
+		o.logger.Debugw("Extracted built images from ADO logs", "images", buildReport.Images, "architectures", buildReport.Architectures)
+
+		imagesJSON, err := json.Marshal(buildReport.Images)
+		if err != nil {
+			return fmt.Errorf("cannot marshal list of images: %w", err)
+		}
+
+		architecturesJSON, err := json.Marshal(buildReport.Architectures)
+		if err != nil {
+			return fmt.Errorf("cannot marshal list of architectures: %w", err)
+		}
+
+		o.logger.Debugw("Set GitHub outputs", "images", string(imagesJSON), "architectures", string(architecturesJSON), "digest", buildReport.Digest, "adoResult", string(*pipelineRunResult))
+
+		err = actions.SetOutput("images", string(imagesJSON))
+		if err != nil {
+			return fmt.Errorf("cannot set images GitHub output: %w", err)
+		}
+
+		if err := actions.SetOutput("architectures", string(architecturesJSON)); err != nil {
+			return fmt.Errorf("cannot set architectures GitHub output: %w", err)
+		}
+
+		if err := actions.SetOutput("digest", buildReport.Digest); err != nil {
+			return fmt.Errorf("cannot set digest GitHub output: %w", err)
+		}
+
+		// Output full build report as JSON
+		buildReportJSON, err := json.Marshal(buildReport)
+		if err != nil {
+			return fmt.Errorf("cannot marshal build report: %w", err)
+		}
+
+		if err := actions.SetOutput("build-report", string(buildReportJSON)); err != nil {
+			return fmt.Errorf("cannot set build-report GitHub output: %w", err)
+		}
+
+		err = actions.SetOutput("adoResult", string(*pipelineRunResult))
+		if err != nil {
+			return fmt.Errorf("cannot set adoResult GitHub output: %w", err)
+		}
+	}
+
+	if o.buildReportPath != "" {
+		err = imagebuilder.WriteReportToFile(buildReport, o.buildReportPath)
+		if err != nil {
+			return fmt.Errorf("failed writing build report to file: %w", err)
+		}
+	}
+
+	// Handle the ADO pipeline run failure.
+	if *pipelineRunResult == pipelines.RunResultValues.Failed || *pipelineRunResult == pipelines.RunResultValues.Unknown {
+		return fmt.Errorf("build in ADO finished with status: %s", *pipelineRunResult)
+	}
+	return nil
 }
 
+// TODO: write tests for this function
 func signImages(o *options, images []string) error {
 	// use o.orgRepo as default value since someone might have loaded is as a flag
 	orgRepo := o.orgRepo
@@ -351,114 +486,107 @@ func (l *StrList) List() []string {
 	return n
 }
 
-func getTags(pr, sha string, templates []tags.Tag) ([]tags.Tag, error) {
-	// (Ressetkk): PR tag should not be hardcoded, in the future we have to find a way to parametrize it
-	if pr != "" {
-		// assume we are using PR number, build default tag as 'PR-XXXX'
-		return []tags.Tag{{Name: "default_tag", Value: "PR-" + pr}}, nil
+func getTags(logger Logger, pr, sha string, templates []tags.Tag) ([]tags.Tag, error) {
+	logger.Debugw("started building tags", "pr_number", pr, "commit_sha", sha, "templates", templates)
+
+	logger.Debugw("building tagger options")
+	var taggerOptions []tags.TagOption
+	if len(pr) > 0 {
+		taggerOptions = append(taggerOptions, tags.PRNumber(pr))
+		logger.Debugw("pr number is set, adding tagger option", "pr_number", pr)
 	}
+	if len(sha) > 0 {
+		taggerOptions = append(taggerOptions, tags.CommitSHA(sha))
+		logger.Debugw("commit sha is set, adding tagger option", "commit_sha", sha)
+	}
+
+	taggerOptions = append(taggerOptions, tags.WithLogger(logger))
+	logger.Debugw("added logger to tagger options")
 	// build a tag from commit SHA
-	tagger, err := tags.NewTagger(templates, tags.CommitSHA(sha))
+	tagger, err := tags.NewTagger(logger, templates, taggerOptions...)
 	if err != nil {
-		return nil, fmt.Errorf("get tagger: %w", err)
+		return nil, fmt.Errorf("failed creating tagger instance: %w", err)
 	}
+	logger.Debugw("created tagger instance with options, starting parsing tags")
 	p, err := tagger.ParseTags()
 	if err != nil {
 		return nil, fmt.Errorf("build tag: %w", err)
 	}
-	return p, nil
-}
+	logger.Debugw("parsed tags successfully", "tags", p)
 
-func gatherDestinations(repo []string, name string, tags []tags.Tag) []string {
-	var dst []string
-	for _, t := range tags {
-		for _, r := range repo {
-			image := path.Join(r, name)
-			dst = append(dst, image+":"+strings.ReplaceAll(t.Value, " ", "-"))
-		}
-	}
-	return dst
+	return p, nil
 }
 
 // validateOptions handles options validation. All checks should be provided here
 func validateOptions(o options) error {
 	var errs []error
+
 	if o.context == "" {
 		errs = append(errs, fmt.Errorf("flag '--context' is missing"))
 	}
+
 	if o.name == "" {
 		errs = append(errs, fmt.Errorf("flag '--name' is missing"))
 	}
+
 	if o.dockerfile == "" {
 		errs = append(errs, fmt.Errorf("flag '--dockerfile' is missing"))
 	}
+
+	if o.configPath == "" {
+		errs = append(errs, fmt.Errorf("'--config' flag is missing or has empty value, please provide the path to valid 'config.yaml' file"))
+	}
+
+	if o.signOnly && len(o.imagesToSign) == 0 {
+		errs = append(errs, fmt.Errorf("flag '--images-to-sign' is missing, please provide at least one image to sign"))
+	}
+	if !o.signOnly && len(o.imagesToSign) > 0 {
+		errs = append(errs, fmt.Errorf("flag '--sign-only' is missing or has false value, please set it to true when using '--images-to-sign' flag"))
+	}
+
+	if o.adoPreviewRun && o.adoPreviewRunYamlPath == "" {
+		errs = append(errs, fmt.Errorf("ado-preview-run-yaml-path flag is missing, please provide path to yaml file with ADO pipeline definition"))
+	}
+
+	if o.adoPreviewRunYamlPath != "" && !o.adoPreviewRun {
+		errs = append(errs, fmt.Errorf("ado-preview-run-yaml-path flag is provided, but adoPreviewRun flag is not set to true"))
+	}
+
 	return errutil.NewAggregate(errs)
-}
-
-// loadEnv loads environment variables into application runtime from key=value list
-func loadEnv(vfs fs.FS, envFile string) (map[string]string, error) {
-	if len(envFile) == 0 {
-		// file is empty - ignore
-		return nil, nil
-	}
-	f, err := vfs.Open(envFile)
-	if err != nil {
-		return nil, fmt.Errorf("open env file: %w", err)
-	}
-	s := bufio.NewScanner(f)
-	vars := make(map[string]string)
-	for s.Scan() {
-		kv := s.Text()
-		sp := strings.SplitN(kv, "=", 2)
-		key, val := sp[0], sp[1]
-		if len(sp) > 2 {
-			return nil, fmt.Errorf("env var split incorrectly: 2 != %v", len(sp))
-		}
-		if _, ok := os.LookupEnv(key); ok {
-			// do not override env variable if it's already present in the runtime
-			// do not include in vars map since dev should not have access to it anyway
-			continue
-		}
-		err := os.Setenv(key, val)
-		if err != nil {
-			return nil, fmt.Errorf("setenv: %w", err)
-		}
-		// add value to the vars that will be injected as build args
-		vars[key] = val
-	}
-	return vars, nil
-}
-
-// Add parsed tags to environments which will be passed to dockerfile
-func addTagsToEnv(tags []tags.Tag, envs map[string]string) map[string]string {
-	m := make(map[string]string)
-
-	for _, t := range tags {
-		key := fmt.Sprintf("TAG_%s", t.Name)
-		m[key] = t.Value
-	}
-
-	for k, v := range envs {
-		m[k] = v
-	}
-
-	return m
 }
 
 func (o *options) gatherOptions(flagSet *flag.FlagSet) *flag.FlagSet {
 	flagSet.BoolVar(&o.silent, "silent", false, "Do not push build logs to stdout")
 	flagSet.StringVar(&o.configPath, "config", "/config/image-builder-config.yaml", "Path to application config file")
 	flagSet.StringVar(&o.context, "context", ".", "Path to build directory context")
-	flagSet.StringVar(&o.envFile, "env-file", "", "Path to file with environment variables to be loaded in build")
-	flagSet.StringVar(&o.name, "name", "", "Name of the image to be built")
-	flagSet.StringVar(&o.dockerfile, "dockerfile", "Dockerfile", "Path to Dockerfile file relative to context")
-	flagSet.StringVar(&o.variant, "variant", "", "If variants.yaml file is present, define which variant should be built. If variants.yaml is not present, this flag will be ignored")
+	flagSet.StringVar(&o.name, "name", "", "name of the image to be built")
+	flagSet.StringVar(&o.dockerfile, "dockerfile", "dockerfile", "Path to dockerfile file relative to context")
 	flagSet.StringVar(&o.logDir, "log-dir", "/logs/artifacts", "Path to logs directory where GCB logs will be stored")
+	flagSet.BoolVar(&o.debug, "debug", false, "Enable debug logging")
+	flagSet.BoolVar(&o.dryRun, "dry-run", false, "Do not build the image, only print a ADO API call pipeline parameters")
+	// TODO: What is expected value repo only or org/repo? How this flag influence an image builder behaviour?
 	flagSet.StringVar(&o.orgRepo, "repo", "", "Load repository-specific configuration, for example, signing configuration")
 	flagSet.Var(&o.tags, "tag", "Additional tag that the image will be tagged with. Optionally you can pass the name in the format name=value which will be used by export-tags")
-	flagSet.Var(&o.buildArgs, "build-arg", "Flag to pass additional arguments to build Dockerfile. It can be used in the name=value format.")
-	flagSet.Var(&o.platforms, "platform", "Only supported with BuildKit. Platform of the image that is built")
-	flagSet.BoolVar(&o.exportTags, "export-tags", false, "Export parsed tags as build-args into Dockerfile. Each tag will have format TAG_x, where x is the tag name passed along with the tag")
+	flagSet.StringVar(&o.tagsBase64, "tag-base64", "", "String representation of all tags encoded by base64. String representation must be in format as output of kyma-project/test-infra/pkg/tags.Tags.String() method")
+	flagSet.Var(&o.buildArgs, "build-arg", "Flag to pass additional arguments to build dockerfile. It can be used in the name=value format.")
+	flagSet.Var(&o.platforms, "platform", "Platform of the image that is built (default: linux/amd64,linux/arm64)")
+	flagSet.BoolVar(&o.exportTags, "export-tags", false, "Export parsed tags as build-args into dockerfile. Each tag will have format TAG_x, where x is the tag name passed along with the tag")
+	flagSet.BoolVar(&o.signOnly, "sign-only", false, "Only sign the image, do not build it")
+	flagSet.Var(&o.imagesToSign, "images-to-sign", "Comma-separated list of images to sign. Only used when sign-only flag is set")
+	flagSet.BoolVar(&o.adoPreviewRun, "ado-preview-run", false, "Trigger ADO pipeline in preview mode")
+	flagSet.StringVar(&o.adoPreviewRunYamlPath, "ado-preview-run-yaml-path", "", "Path to yaml file with ADO pipeline definition to be used in preview mode")
+	flagSet.BoolVar(&o.parseTagsOnly, "parse-tags-only", false, "Only parse tags and print them to stdout")
+	flagSet.StringVar(&o.oidcToken, "oidc-token", "", "Token used to authenticate against Azure DevOps backend service")
+	flagSet.StringVar(&o.azureClientID, "azure-client-id", "", "Azure AD Application (client) ID used to authenticate against Azure DevOps API")
+	flagSet.StringVar(&o.azureClientSecret, "azure-client-secret", "", "Azure AD Application client secret used to authenticate against Azure DevOps API")
+	flagSet.StringVar(&o.azureTenantID, "azure-tenant-id", "", "Azure AD Tenant ID used to authenticate against Azure DevOps API")
+	flagSet.StringVar(&o.tagsOutputFile, "tags-output-file", "/generated-tags.json", "Path to file where generated tags will be written as JSON")
+	flagSet.BoolVar(&o.useGoInternalSAPModules, "use-go-internal-sap-modules", false, "Allow access to Go internal modules in ADO backend")
+	flagSet.StringVar(&o.buildReportPath, "build-report-path", "", "Path to file where build report will be written as JSON")
+	flagSet.BoolVar(&o.adoStateOutput, "ado-state-output", false, "Set output variables with result of image-buidler exececution")
+	flagSet.StringVar(&o.target, "target", "", "Specify which build stage in the Dockerfile to use as the target")
+	flagSet.BoolVar(&o.useRestrictedRegistry, "use-restricted-registry", false, "Enable building images using Chainguard restricted base images")
+
 	return flagSet
 }
 
@@ -467,13 +595,46 @@ func main() {
 	o := options{isCI: os.Getenv("CI") == "true"}
 	o.gatherOptions(flagSet)
 	if err := flagSet.Parse(os.Args[1:]); err != nil {
+		log.Fatalf("Failed to parse flags: %s", err)
+	}
+
+	var (
+		zapLogger *zap.Logger
+		err       error
+	)
+	if o.debug {
+		zapLogger, err = zap.NewDevelopment()
+	} else {
+		zapLogger, err = zap.NewProduction()
+	}
+	if err != nil {
+		log.Fatalf("Failed to initialize logger: %s", err)
+	}
+	o.logger = zapLogger.Sugar()
+
+	// If running inside some CI system, determine which system is used
+	if o.isCI {
+		o.ciSystem, err = DetermineUsedCISystem()
+		if err != nil {
+			o.logger.Errorw("Failed to determine current ci system", "error", err)
+			os.Exit(1)
+		}
+
+		o.gitState, err = LoadGitStateConfig(o.logger, o.ciSystem)
+		if err != nil {
+			o.logger.Errorw("Failed to load current git state", "error", err)
+			os.Exit(1)
+		}
+
+		o.logger.Debugw("Git state loaded", "gitState", o.gitState)
+	}
+
+	// validate if options provided by flags and config file are fine
+	if err := validateOptions(o); err != nil {
 		fmt.Println(err)
 		os.Exit(1)
 	}
-	if o.configPath == "" {
-		fmt.Println("'--config' flag is missing or has empty value, please provide the path to valid 'config.yaml' file")
-		os.Exit(1)
-	}
+
 	c, err := os.ReadFile(o.configPath)
 	if err != nil {
 		fmt.Println(err)
@@ -485,43 +646,195 @@ func main() {
 		os.Exit(1)
 	}
 
-	// validate if options provided by flags and config file are fine
-	if err := validateOptions(o); err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-
-	context, err := filepath.Abs(o.context)
-	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
-	}
-	dockerfilePath := filepath.Join(context, filepath.Dir(o.dockerfile))
-
-	var variant Variants
-	var envs map[string]string
-	if len(o.envFile) > 0 {
-		envs, err = loadEnv(os.DirFS(dockerfilePath), o.envFile)
+	if o.signOnly {
+		err = signImages(&o, o.imagesToSign)
 		if err != nil {
+			if o.adoStateOutput {
+				adopipelines.SetVariable("signing_success", false, false, true)
+			}
+
 			fmt.Println(err)
 			os.Exit(1)
 		}
 
-	} else {
-		variantsFile := filepath.Join(dockerfilePath, "variants.yaml")
-		variant, err = GetVariants(o.variant, variantsFile, os.ReadFile)
-		if err != nil {
-			if !os.IsNotExist(err) {
-				fmt.Println(err)
-				os.Exit(1)
-			}
+		if o.adoStateOutput {
+			adopipelines.SetVariable("signing_success", true, false, true)
 		}
+		os.Exit(0)
 	}
 
-	err = runBuildJob(o, variant, envs)
+	if o.parseTagsOnly {
+		logger := o.logger.With("command", "parse-tags-only")
+		logger.Infow("Parsing tags")
+		err = generateTags(logger, o)
+		if err != nil {
+			logger.Errorw("Parsing tags failed", "error", err)
+			os.Exit(1)
+		}
+		logger.Infow("Tags parsed successfully")
+		os.Exit(0)
+	}
+	err = buildInADO(o)
 	if err != nil {
-		fmt.Println(err)
+		o.logger.Errorw("Image build failed", "error", err, "JobType", o.gitState.JobType)
 		os.Exit(1)
 	}
+
 	fmt.Println("Job's done.")
+}
+
+func generateTags(logger Logger, o options) error {
+	logger.Infow("starting tag generation")
+	logger.Debugw("getting the absolute path to the Dockerfile directory")
+	// Get the absolute path to the dockerfile directory.
+	dockerfileDirPath, err := getDockerfileDirPath(logger, o)
+	if err != nil {
+		return fmt.Errorf("failed to get dockerfile path: %w", err)
+	}
+	logger.Debugw("dockerfile directory path retrieved", "dockerfileDirPath", dockerfileDirPath)
+	logger.Debugw("parsing tags from options")
+	// Parse tags from the provided options.
+	parsedTags, err := parseTags(logger, o)
+	if err != nil {
+		return fmt.Errorf("failed to parse tags from options: %w", err)
+	}
+	logger.Infow("tags parsed successfully", "parsedTags", parsedTags)
+	logger.Debugw("converting parsed tags to JSON")
+	jsonTags, err := tagsAsJSON(parsedTags)
+	if err != nil {
+		return fmt.Errorf("failed generating tags json representation: %w", err)
+	}
+	logger.Debugw("successfully generated image tags in JSON format", "tags", jsonTags)
+	// Write tags to a file.
+	if o.tagsOutputFile != "" {
+		logger.Debugw("tags output file provided", "tagsOutputFile", o.tagsOutputFile)
+		err = writeOutputFile(logger, o.tagsOutputFile, jsonTags)
+		if err != nil {
+			return fmt.Errorf("failed to write tags to file: %w", err)
+		}
+		logger.Infow("tags successfully written to file", "tagsOutputFile", o.tagsOutputFile, "generatedTags", jsonTags)
+	}
+	return nil
+}
+
+// writeOutputFile writes the provided data to the file specified by the path.
+func writeOutputFile(logger Logger, path string, data []byte) error {
+	logger.Debugw("writing generated tags to file", "tagsOutputFile", path)
+	err := os.WriteFile(path, data, 0644)
+	if err != nil {
+		return fmt.Errorf("failed to write tags to file: %s", err)
+	}
+	logger.Debugw("tags written to file")
+	return nil
+}
+
+func tagsAsJSON(parsedTags []tags.Tag) ([]byte, error) {
+	jsonTags, err := json.Marshal(parsedTags)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal tags to json, got error: %w", err)
+	}
+	return jsonTags, err
+}
+
+func parseTags(logger Logger, o options) ([]tags.Tag, error) {
+	logger.Debugw("starting to parse tags")
+	var (
+		pr  string
+		sha string
+	)
+
+	logger.Debugw("reading git state for event type")
+	if !o.gitState.isPullRequest && o.gitState.BaseCommitSHA != "" {
+		sha = o.gitState.BaseCommitSHA
+		logger.Debugw("running for push event, base commit SHA found", "sha", sha)
+	}
+	if o.gitState.isPullRequest && o.gitState.PullRequestNumber > 0 {
+		pr = fmt.Sprint(o.gitState.PullRequestNumber)
+		logger.Debugw("Running for pull request event, PR number found", "pr-number", pr)
+		if len(o.AdditionalPRTag.Value) > 0 {
+			o.tags = append(o.tags, o.AdditionalPRTag)
+			logger.Debugw("additional PR tag appended", "tag", o.AdditionalPRTag.Value)
+		}
+	}
+	if o.gitState.JobType == "merge_group" && o.gitState.PullHeadCommitSHA != "" {
+		sha = o.gitState.PullHeadCommitSHA
+		logger.Debugw("running for merge_group event, pull head commit SHA found", "sha", sha)
+	}
+
+	// TODO (dekiel): Tags provided as base64 encoded string should be parsed and added to the tags list when parsing flags.
+	//   This way all tags are available in the tags list from thr very beginning of execution and can be used in any process.
+
+	logger.Debugw("checking if base64 encoded tags are provided")
+	// read tags from base64 encoded string if provided
+	if o.tagsBase64 != "" {
+		logger.Debugw("base64 encoded tags provided, starting to decode", "tagsBase64", o.tagsBase64)
+		decoded, err := base64.StdEncoding.DecodeString(o.tagsBase64)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode base64 encoded tags, error: %w", err)
+		}
+		logger.Debugw("tags successfully decoded", "decoded", string(decoded))
+		splitedTags := strings.Split(string(decoded), ",")
+		logger.Debugw("splitted decoded tags", "splitedTags", splitedTags)
+		for _, tag := range splitedTags {
+			logger.Debugw("adding tag", "tag", tag)
+			err = o.tags.Set(tag)
+			if err != nil {
+				return nil, fmt.Errorf("failed to set tag, tag: %s, error: %w", tag, err)
+			}
+			logger.Debugw("tag set successfully")
+		}
+		logger.Debugw("all base64 encoded tags successfully added", "tags", o.tags.String())
+	} else {
+		logger.Debugw("no base64 encoded tags provided")
+	}
+
+	logger.Debugw("getting default tag")
+	defaultTag, err := getDefaultTag(logger, o)
+	if err != nil {
+		return nil, fmt.Errorf("failed to retrieve default tag, error: %w", err)
+	}
+	logger.Debugw("default tag retrieved", "defaultTag", defaultTag)
+
+	logger.Debugw("parsing tags")
+	parsedTags, err := getTags(logger, pr, sha, append(o.tags, defaultTag))
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse tags: %w", err)
+	}
+	logger.Debugw("tags parsed successfully", "parsedTags", parsedTags)
+
+	return parsedTags, nil
+}
+
+// getDefaultTag returns the default tag based on the read git state.
+// The function provide default tag for pull request or commit.
+// The default tag is read from the provided 'options' struct.
+func getDefaultTag(logger Logger, o options) (tags.Tag, error) {
+	logger.Debugw("reading gitstate data")
+	if o.gitState.JobType == "merge_group" {
+		logger.Debugw("merge_group event, returning default merge group tag")
+		return o.DefaultMergeGroupTag, nil
+	}
+	if o.gitState.isPullRequest && o.gitState.PullRequestNumber > 0 {
+		logger.Debugw("pull request number provided, returning default pr tag")
+		return o.DefaultPRTag, nil
+	}
+	if len(o.gitState.BaseCommitSHA) > 0 {
+		o.logger.Debugw("commit sha provided, returning default commit tag")
+		return o.DefaultCommitTag, nil
+	}
+	return tags.Tag{}, fmt.Errorf("could not determine default tag, no pr number or commit sha provided")
+}
+
+func getDockerfileDirPath(logger Logger, o options) (string, error) {
+	logger.Debugw("starting to get Dockerfile directory path", "dockerfile", o.dockerfile, "context", o.context)
+	// Get the absolute path to the build context directory.
+	context, err := filepath.Abs(o.context)
+	if err != nil {
+		return "", fmt.Errorf("could not get absolute path to build context directory: %w", err)
+	}
+	logger.Debugw("successfully retrieved absolute path to context directory", "absolute_path", context)
+	// Get the absolute path to the dockerfile.
+	dockerfileDirPath := filepath.Join(context, filepath.Dir(o.dockerfile))
+	logger.Debugw("dockerfile directory path constructed", "dockerfileDirPath", dockerfileDirPath)
+	return dockerfileDirPath, err
 }

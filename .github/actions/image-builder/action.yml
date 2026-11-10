@@ -1,0 +1,137 @@
+name: image-builder
+description: "Triggers the run of the ADO image builder backend"
+inputs:
+  oidc-token:
+    description: The JWT token to authenticate against Azure DevOps image builder backend
+    required: true
+  azure-client-id:
+    description: Azure AD Application (client) ID to authenticate against Azure DevOps API
+    required: true
+  azure-client-secret:
+    description: Azure AD Application client secret to authenticate against Azure DevOps API
+    required: true
+  azure-tenant-id:
+    description: Azure AD Tenant ID to authenticate against Azure DevOps API
+    required: true
+  image-name:
+    description: Name of the build image
+    required: true
+  context:
+    description: Build context to build container from
+    required: false
+    default: .
+  dockerfile:
+    description: Path to the dockerfile used to build docker image
+    required: false
+    default: Dockerfile
+  build-args:
+    description: "Additional arguments to build dockerfile. It can be used in the name=value format."
+    required: false
+    default: ""
+  tags:
+    description: "Additional tags that the image will be tagged with. Optionally you can pass the name in the format name=value which will be used by export-tags"
+    required: false
+    default: ""
+  export-tags:
+    description: Export parsed tags as build-args into dockerfile. Each tag will have format TAG_x, where x is the tag name passed along with the tag
+    required: false
+    default: false
+  config:
+    description: Path to the config file
+    required: false
+    default: "./configs/image-builder-client-config.yaml"
+  dry-run:
+    description: Prevent actual triggering the image builder
+    required: false
+    default: false
+  use-go-internal-sap-modules:
+    description: Setup access to Go internal SAP modules in build environment
+    required: false
+    default: false
+  platforms:
+    description: The platforms to build the image for, one per line. If not set, the default platforms (linux/arm64,linux/amd64) will be used.
+    required: false
+    default: |
+      linux/arm64
+      linux/amd64
+  target:
+    description: Specify which build stage in the Dockerfile to use as the target
+    required: false
+    default: ""
+  use-restricted-registry:
+    description: Enable building images using Chainguard restricted base images
+    required: false
+    default: false
+
+outputs:
+  adoResult:
+    description: The result of the ADO pipeline execution
+    value: ${{ steps.build.outputs.adoResult }}
+  images:
+    description: JSON array of the images built in ADO
+    value: ${{ steps.build.outputs.images }}
+  architectures:
+    description: JSON array of the image architectures built in ADO (eg. linux/arm64)
+    value: ${{ steps.build.outputs.architectures }}
+  digest:
+    description: The digest of the built image (e.g. sha256:abc123...)
+    value: ${{ steps.build.outputs.digest }}
+  build-report:
+    description: Full build report as JSON containing status, images, digest, tags, architectures, etc.
+    value: ${{ steps.build.outputs.build-report }}
+
+runs:
+  using: "composite"
+  steps:
+    - env:
+        INPUT_BUILD_ARGS: ${{ inputs.build-args }}
+      run: |
+        readarray -t lines <<< "$INPUT_BUILD_ARGS"
+        result=""
+        for entry in "${lines[@]}"; do
+          if [[ -n "$entry" ]]; then
+            [[ "$entry" =~ ^[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9._:/@+\-]*$ ]] || \
+              { echo "::error::Invalid build-arg: $entry"; exit 1; }
+            result+=" --build-arg=$entry"
+          fi
+        done
+        echo "build-args=$result" >> "$GITHUB_OUTPUT"
+      id: prepare-build-args
+      shell: bash
+
+    - env:
+        INPUT_TAGS: ${{ inputs.tags }}
+      run: |
+        readarray -t lines <<< "$INPUT_TAGS"
+        result=""
+        for entry in "${lines[@]}"; do
+          if [[ -n "$entry" ]]; then
+            [[ "$entry" =~ ^[A-Za-z0-9._:/@+\-]+(=[A-Za-z0-9._:/@+\-]+)?$ ]] || \
+              { echo "::error::Invalid tag: $entry"; exit 1; }
+            result+=" --tag=$entry"
+          fi
+        done
+        echo "tags=$result" >> "$GITHUB_OUTPUT"
+      id: prepare-tags
+      shell: bash
+
+    - env:
+        INPUT_PLATFORMS: ${{ inputs.platforms }}
+      run: |
+        readarray -t lines < <(tr ',' '\n' <<< "$INPUT_PLATFORMS")
+        result=""
+        for entry in "${lines[@]}"; do
+          if [[ -n "$entry" ]]; then
+            [[ "$entry" =~ ^linux/(amd64|arm64)$ ]] || \
+              { echo "::error::Invalid platform: $entry"; exit 1; }
+            result+=" --platform=$entry"
+          fi
+        done
+        echo "platforms=$result" >> "$GITHUB_OUTPUT"
+      id: prepare-platforms
+      shell: bash
+
+    - uses: docker://europe-docker.pkg.dev/kyma-project/prod/image-builder:v20261103075112
+      id: build
+      with:
+        args: --name=${{ inputs.image-name }} --context=${{ inputs.context }} --dockerfile=${{ inputs.dockerfile }} --target=${{ inputs.target }} --oidc-token=${{ inputs.oidc-token }} --azure-client-id=${{ inputs.azure-client-id }} --azure-client-secret=${{ inputs.azure-client-secret }} --azure-tenant-id=${{ inputs.azure-tenant-id }} ${{ steps.prepare-build-args.outputs.build-args }} ${{ steps.prepare-tags.outputs.tags }} ${{ steps.prepare-platforms.outputs.platforms }} --export-tags=${{ inputs.export-tags }} --config=${{ inputs.config }} --use-go-internal-sap-modules=${{ inputs.use-go-internal-sap-modules }} --use-restricted-registry=${{ inputs.use-restricted-registry }} --dry-run=${{ inputs.dry-run }}

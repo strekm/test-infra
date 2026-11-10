@@ -4,15 +4,23 @@ on:
   schedule:
     # Run everyday at 5:00 AM
     - cron: "0 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
 jobs:
   markdown-link-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: gaurav-nelson/github-action-markdown-link-check@v1
+      - name: Checkout repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7
         with:
-          use-quiet-mode: "yes"
-          use-verbose-mode: "yes"
-          config-file: ".mlc.config.json"
-          folder-path: "."
-          max-depth: -1
+          node-version: '26.x'
+      - name: Install md-check-link
+        run: npm install -g md-check-link
+      - name: Verify links
+        run: |
+          md-check-link -q -n 8 -c https://raw.githubusercontent.com/kyma-project/md-check-link/main/.mlc.config.json ./

@@ -1,0 +1,139 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+
+  "extends": [
+    "config:recommended",
+    "customManagers:dockerfileVersions",
+    "helpers:pinGitHubActionDigests"
+  ],
+
+  "labels": ["renovate-dependencies"],
+
+  "automerge": true,
+  "automergeType": "pr",
+  "platformAutomerge": true,
+  "rebaseWhen": "conflicted",
+
+  "ignorePaths": [
+    "**/node_modules/**",
+    "**/bower_components/**",
+    "**/test*/**",
+    "**/cypress/**",
+    "component-config.yaml"
+  ],
+
+  "packageRules": [
+    {
+      "matchManagers": ["gomod"],
+      "groupName": "All Go dependencies",
+      "rangeStrategy": "bump",
+      "postUpdateOptions": ["gomodUpdateImportPaths"]
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "groupName": "github actions",
+      "separateMajorMinor": true,
+      "prPriority": 5
+    },
+    {
+      "matchManagers": ["github-actions"],
+      "matchPackageNames": ["kyma*/**", "github/codeql-action"],
+      "pinDigests": false
+    },
+    {
+      "matchManagers": ["pip_requirements"],
+      "groupName": "python dependencies"
+    },
+    {
+      "matchDatasources": ["terraform-provider"],
+      "groupName": "terraform providers"
+    },
+    {
+      "matchDatasources": ["docker"],
+      "groupName": "docker deps"
+    },
+    {
+      "matchManagers": ["regex"],
+      "matchDatasources": ["docker"],
+      "matchCurrentVersion": "!/v?\\d+\\.\\d+\\.\\d+/",
+      "versioning": "loose",
+      "groupName": "custom docker images (loose) to {{newVersion}}",
+      "commitMessageTopic": "custom docker images (loose) to {{newVersion}}",
+      "commitMessageExtra": "",
+      "separateMajorMinor": false,
+      "maxMajorIncrement": 0
+    },
+    {
+      "matchManagers": ["regex"],
+      "matchDatasources": ["docker"],
+      "matchCurrentVersion": "v?\\d+\\.\\d+\\.\\d+",
+      "versioning": "semver",
+      "groupName": "custom docker images (semver) to {{newVersion}}",
+      "commitMessageTopic": "custom docker images (semver) to {{newVersion}}",
+      "commitMessageExtra": "",
+      "separateMajorMinor": false
+    },
+    {
+      "matchDepNames": [
+        "europe-docker.pkg.dev/kyma-project/prod/external/library/**"
+      ],
+      "commitMessageTopic": "external/library image"
+    },
+    {
+      "matchDepNames": ["europe-docker.pkg.dev/kyma-project/prod/external/library/golang"],
+      "groupName": "All Go dependencies"
+    },
+    {
+      "matchDepNames": [
+        "europe-docker.pkg.dev/kyma-project/prod/**"
+      ],
+      "commitMessageTopic": "prod image"
+    },
+    {
+      "matchDepNames": [
+        "europe-docker.pkg.dev/kyma-project/dev/**"
+      ],
+      "commitMessageTopic": "dev image"
+    },
+    {
+      "description": "Mirror tags are immutable; refresh digests only with version upgrades.",
+      "matchFileNames": ["**/external-images.yaml", "**/external-images.yml"],
+      "matchDatasources": ["docker"],
+      "matchUpdateTypes": ["digest"],
+      "enabled": false
+    }
+  ],
+
+  "customManagers": [
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/.ya?ml$/",
+        "/.sh$/",
+        "/.json$/",
+        "/.tf$/",
+        "/.tfvars$/"
+      ],
+      "matchStrings": [
+        "(?<depName>[a-z0-9.-]*\\.[a-z0-9.-]*(?:/[a-z0-9._-]+)+):(?<currentValue>(?:v?\\d[\\w.-]*))"
+      ],
+      "depNameTemplate": "{{depName}}",
+      "currentValueTemplate": "{{currentValue}}",
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "/external-images\\.ya?ml$/"
+      ],
+      "matchStrings": [
+        "source:\\s*\"(?<depName>[^:@\"]+):(?<currentValue>[^@\"]+)\"",
+        "source:\\s*\"(?<depName>[^:@\"]+)@(?<currentDigest>sha256:[a-f0-9]{64})\"\\s+tag:\\s*\"(?<currentValue>[^\"]+)\""
+      ],
+      "depNameTemplate": "{{depName}}",
+      "currentValueTemplate": "{{currentValue}}",
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
+    }
+  ]
+}

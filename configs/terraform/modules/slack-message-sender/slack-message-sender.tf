@@ -23,9 +23,10 @@ resource "google_secret_manager_secret_iam_member" "slack_msg_sender_common_slac
   member    = "serviceAccount:${google_service_account.slack_message_sender.email}"
 }
 
+# Will be deleted after the migration is complete.
 resource "google_cloud_run_service" "slack_message_sender" {
   depends_on = [google_secret_manager_secret_iam_member.slack_msg_sender_common_slack_bot_token_accessor]
-  name       = "slack-message-sender"
+  name       = "old-slack-message-sender"
   location   = "europe-west3"
 
   metadata {
@@ -38,7 +39,7 @@ resource "google_cloud_run_service" "slack_message_sender" {
     spec {
       service_account_name = google_service_account.slack_message_sender.email
       containers {
-        image = "europe-docker.pkg.dev/kyma-project/prod/test-infra/slackmessagesender:v20231002-7c46d020"
+        image = "europe-docker.pkg.dev/kyma-project/prod/test-infra/old-slackmessagesender:v20261104052522"
         env {
           name  = "PROJECT_ID"
           value = var.gcp_project_id
@@ -54,10 +55,6 @@ resource "google_cloud_run_service" "slack_message_sender" {
         env {
           name  = "PROW_DEV_NULL_SLACK_CHANNEL_ID"
           value = "C01KSP10MB5" # kyma-prow-dev-null
-        }
-        env {
-          name  = "RELEASE_SLACK_CHANNEL_ID"
-          value = "C01KKPXCPK8" # kyma-skr-release
         }
         env {
           name  = "KYMA_TEAM_SLACK_CHANNEL_ID"

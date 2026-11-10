@@ -1,17 +1,10 @@
 name: Pull Plan Prod Terraform
 run-name: pull-plan-prod-terraform
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number }}
-on: # runs on main
-  pull_request_target:
-    types: [opened, edited, synchronize, reopened, ready_for_review]
-    branches:
-      - main
-    paths:
-      - "**.tf"
-      - "**.tfvars"
-      - "**.yaml"
-      - "**.yml"
+
+on:
+  # This workflow is triggered by workflow controller.
+  workflow_call:
+
 jobs:
   pull-plan-prod-terraform:
     permissions:
@@ -19,64 +12,88 @@ jobs:
       id-token: "write" # needed for gcp_auth to create id token
       issues: "write" # needed for tfcmt to post comments
       pull-requests: "write" # needed for tfcmt to post comments
+    environment:
+      name: prod
+      deployment: false
 
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout
-        id: checkout
-        uses: actions/checkout@v4
+      # Triggered via workflow-controller-pull-requests on pull_request_target.
+      # Fork PR checkout is gated by the `prod` environment's required reviewers
+      # and the composite action's sanity check on the merge commit's parent.
+      - name: Checkout PR code
+        uses: kyma-project/test-infra/.github/actions/checkout@main
         with:
-          ref: "refs/pull/${{ github.event.number }}/merge"
-          fetch-depth: 50
-
-      # Important security check: https://github.com/actions/checkout/issues/518
-      - name: Sanity check
-        id: sanity-check
-        run: |
-          [[ "$(git rev-parse 'HEAD^1')" == "${{ github.event.pull_request.head.sha }}" || "$(git rev-parse 'HEAD^2')" == "${{ github.event.pull_request.head.sha }}" ]]
-
-      - name: Wait for other terraform executions
-        id: wait_for_terraform
-        uses: ahmadnassri/action-workflow-queue@v1.1.5
+          allow-unsafe-pr-checkout: "true"
 
       - name: Authenticate to GCP
         id: gcp_auth
-        uses: google-github-actions/auth@v1
+        uses: google-github-actions/auth@7c6bc770dae815cd3e89ee6cdf493a5fab2cc093 # v3
         with:
-          workload_identity_provider: ${{ vars.GH_COM_KYMA_PROJECT_GCP_WORKLOAD_IDENTITY_FEDERATION_PROVIDER }} #workload_identity_provider: "projects/351981214969/locations/global/workloadIdentityPools/github-com-kyma-project/providers/github-com-kyma-project"
-          service_account: ${{ vars.GCP_TERRAFORM_EXECUTOR_SERVICE_ACCOUNT_EMAIL }} #service_account: "terraform-executor@sap-kyma-prow.iam.gserviceaccount.com"
+          workload_identity_provider: ${{ vars.GH_COM_KYMA_PROJECT_GCP_WORKLOAD_IDENTITY_FEDERATION_PROVIDER }}
+          service_account: ${{ vars.GCP_TERRAFORM_PLANNER_SERVICE_ACCOUNT_EMAIL }}
+
+      - name: Retrieve Terraform Planner GitHub App credentials
+        id: secrets
+        uses: google-github-actions/get-secretmanager-secrets@bc9c54b29fdffb8a47776820a7d26e77b379d262 # v3
+        with:
+          secrets: |-
+             terraform-planner-app-id:${{ vars.GCP_KYMA_PROJECT_PROJECT_ID }}/${{ vars.GH_TERRAFORM_PLANNER_APP_ID_SECRET_NAME }}
+             terraform-planner-app-private-key:${{ vars.GCP_KYMA_PROJECT_PROJECT_ID }}/${{ vars.GH_TERRAFORM_PLANNER_APP_PRIVATE_KEY_SECRET_NAME }}
+             terraform-planner-internal-app-id:${{ vars.GCP_KYMA_PROJECT_PROJECT_ID }}/${{ vars.GH_TERRAFORM_PLANNER_INTERNAL_APP_ID_SECRET_NAME }}
+             terraform-planner-internal-app-private-key:${{ vars.GCP_KYMA_PROJECT_PROJECT_ID }}/${{ vars.GH_TERRAFORM_PLANNER_INTERNAL_APP_PRIVATE_KEY_SECRET_NAME }}
+
+      - name: Generate GitHub App token for Terraform Planner (github.com)
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ steps.secrets.outputs.terraform-planner-app-id }}
+          private-key: ${{ steps.secrets.outputs.terraform-planner-app-private-key }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Generate GitHub App token for Terraform Planner (github.tools.sap)
+        id: app-token-internal
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ steps.secrets.outputs.terraform-planner-internal-app-id }}
+          private-key: ${{ steps.secrets.outputs.terraform-planner-internal-app-private-key }}
+          owner: kyma
+          github-api-url: https://github.tools.sap/api/v3
 
       - name: Setup Terraform
         id: setup_terraform
-        uses: hashicorp/setup-terraform@v2.0.3
+        uses: opentofu/setup-opentofu@a1320f892987e89d278cc92dc5adc984fb93aca4 # v2
 
       - name: Setup GitHub comments
         id: setup-github-comment
-        uses: shmokmt/actions-setup-github-comment@v2.1.0
+        uses: shmokmt/actions-setup-github-comment@1299f2274bfb3cd0c35f867160a6fb74fd82fdf8 # v2.1.1
         with:
-          version: v6.0.1
+          version: v6.0.2
         if: ${{ !cancelled() }}
 
       - name: setup tfcmt
         id: setup-tfcmt
-        uses: shmokmt/actions-setup-tfcmt@v2.1.0
+        uses: shmokmt/actions-setup-tfcmt@04d5aa6dc61eaa69a4d00257224c9b97f4857819 # v2.1.1
         with:
-          version: v4.4.3
+          version: v4.7.1
 
       - name: Terraform Init
         id: terraform_init
-        run: terraform -chdir=./configs/terraform/environments/prod init -input=false
+        run: tofu -chdir=./configs/terraform/environments/prod init -input=false
 
       - name: Terraform Plan
+      # The IaC variables are lower case. The opentofu will remove TF_VAR prefix from this env var and match the value with variables names in IaC config case sensitive.
+      # I do prefer to keep consistent format of identifiers in IaC config rather than env variables in github action workflow. Thats the reason env var name uses mixed caps.
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ steps.app-token.outputs.token }}
+          TF_VAR_internal_github_token: ${{ steps.app-token-internal.outputs.token }}
         id: terraform_plan
-        run: tfcmt -owner $GITHUB_REPOSITORY_OWNER -repo ${{ github.event.repository.name }} -pr ${{ github.event.pull_request.number }} -sha ${{ github.event.pull_request.head.sha }} plan -- terraform -chdir=./configs/terraform/environments/prod plan -input=false -no-color -lock-timeout=300s
+        run: tfcmt -owner $GITHUB_REPOSITORY_OWNER -repo ${{ github.event.repository.name }} -pr ${{ github.event.pull_request.number || 0 }} -sha ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }} plan -- tofu -chdir=./configs/terraform/environments/prod plan -input=false -no-color -lock-timeout=400s
 
       - name: Hide GitHub comment
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         id: hide-github-comment
         run: github-comment hide --org $GITHUB_REPOSITORY_OWNER --repo ${{ github.event.repository.name }} -pr ${{ github.event.pull_request.number }} -sha1 ${{ github.event.pull_request.head.sha }}
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.event_name == 'pull_request_target' }}

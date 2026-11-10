@@ -1,0 +1,18 @@
+name: pull-validate-dockerfiles
+
+on:
+  # This workflow is triggered by workflow controller.
+  workflow_call:
+
+jobs:
+  hadolint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout PR code
+        uses: kyma-project/test-infra/.github/actions/checkout@main
+
+      - name: Lint Dockerfiles
+        uses: hadolint/hadolint-action@06be81baf89a55ffd0e24b8f04a4185738dd3387 # v3.5.0
+        with:
+          dockerfile: "Dockerfile"
+          recursive: true

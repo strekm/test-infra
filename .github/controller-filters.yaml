@@ -1,0 +1,69 @@
+# This file is used to filter the events that trigger the workflow controllers.
+# Workflows controller are used to manage the execution of jobs in a GitHub Actions workflow.
+# It introduction is required to use the merge queue feature in GitHub Actions.
+# Naming convention of filters: <job_name>-filter
+build-github-webhook-gateway-filter:
+  - "cmd/cloud-run/github-webhook-gateway/*.go"
+  - "cmd/cloud-run/github-webhook-gateway/Dockerfile"
+  - "pkg/**"
+  - "go.mod"
+  - "go.sum"
+
+build-image-builder-filter:
+  - "cmd/image-builder/*.go"
+  - "cmd/image-builder/*"
+  - "pkg/**"
+  - "go.mod"
+  - "go.sum"
+
+build-oidc-token-verifier-filter:
+  - "cmd/oidc-token-verifier/**"
+  - "pkg/**"
+  - "go.mod"
+  - "go.sum"
+
+build-slack-message-sender-filter:
+  - "cmd/cloud-run/slackmessagesender/**"
+
+buildx-images-filter:
+  - "images/**"
+  - ".github/workflows/image-builder.yml"
+
+pull-go-lint-filter:
+  - ".github/workflows/pull-go-lint.yaml"
+  - "**/*.go"
+  - ".golangci.yaml"
+
+pull-plan-prod-terraform-filter:
+  - "**.tf"
+  - "**.tfvars"
+  - "**.yaml"
+  - "**.yml"
+
+pull-unit-test-go-filter:
+  - ".github/workflows/pull-unit-test-go.yaml"
+  - "**/*.go"
+  - "go.mod"
+  - "go.sum"
+
+pull-validate-dockerfiles-filter:
+  - ".github/workflows/pull-validate-dockerfiles.yaml"
+  - "**/Dockerfile"
+
+tf-lint-filter:
+  - ".github/workflows/tf-lint.yaml"
+  - "**/*.tf"
+  - "**/*.tfvars"
+  - ".tflint.hcl"
+
+code-checks-python-filter:
+  - ".github/workflows/code-checks-python.yml"
+  - "**/*.py"
+  - "**/requirements.txt"
+
+pull-validate-image-builder-action-filter:
+  - ".github/actions/image-builder/**"
+  - ".github/workflows/pull-validate-image-builder-action.yaml"
+
+lint-markdown-links-pr-filter:
+  - "**/*"
